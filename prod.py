@@ -6,12 +6,53 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 import threading
 
-root = ttk.Window(themename="superhero") 
+# Import AES-related libraries
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+import hashlib
+import base64
+import os
+
+# ---------------- AES ENCRYPTION / DECRYPTION FUNCTIONS ----------------
+def encrypt_message_aes(message, key):
+    """
+    Encrypts a plaintext message using AES-256 (CBC mode).
+    A key is derived from the provided string via SHA-256.
+    Returns the base64 encoded string of IV+ciphertext.
+    """
+    key_bytes = hashlib.sha256(key.encode()).digest()  # 32 bytes for AES-256
+    cipher = AES.new(key_bytes, AES.MODE_CBC)  # Generates a random IV automatically
+    iv = cipher.iv
+    padded_message = pad(message.encode(), AES.block_size)
+    ciphertext = cipher.encrypt(padded_message)
+    encrypted = iv + ciphertext  # Prepend IV to ciphertext
+    return base64.b64encode(encrypted).decode('utf-8')
+
+def decrypt_message_aes(encrypted_message, key):
+    """
+    Decrypts a base64 encoded string that contains IV+ciphertext.
+    Returns the original plaintext message.
+    """
+    try:
+        key_bytes = hashlib.sha256(key.encode()).digest()
+        encrypted_bytes = base64.b64decode(encrypted_message)
+        iv = encrypted_bytes[:AES.block_size]
+        ciphertext = encrypted_bytes[AES.block_size:]
+        cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+        padded_message = cipher.decrypt(ciphertext)
+        message = unpad(padded_message, AES.block_size)
+        return message.decode('utf-8')
+    except Exception as e:
+        messagebox.showerror("Error", "Decryption failed! Check your key.")
+        return ""
+
+# ---------------- MAIN WINDOW & GLOBALS ----------------
+root = ttk.Window(themename="superhero")  # Default Light Theme
 root.title("Steganography Tool")
 root.geometry("550x780")
 root.resizable(False, False)
 
-is_dark_mode = False 
+is_dark_mode = False  # Track the theme state
 selected_file = ""
 
 # ---------------- PROGRESS BAR FUNCTION ----------------
@@ -28,7 +69,7 @@ def select_file():
         selected_file = file_path
         entry_file.delete(0, tk.END)
         entry_file.insert(0, file_path)
-        update_char_limit()  
+        update_char_limit()  # Update the max character count when a file is selected
 
 def copy_to_clipboard():
     """Copies the decoded message to clipboard."""
@@ -62,14 +103,17 @@ def update_char_limit():
         max_char_label.config(text="Max characters: N/A")
 
 # ---------------- IMAGE STEGANOGRAPHY FUNCTIONS ----------------
-def encode_image(image_path, message, output_path):
-    """Encodes a message into an image using LSB steganography."""
+def encode_image(image_path, message, output_path, key):
+    """Encodes a message into an image using LSB steganography with AES encryption."""
     img = cv2.imread(image_path)
     if img is None:
         messagebox.showerror("Error", "Could not open the image!")
         return
 
-    message += '####'  # End marker
+    # Encrypt the message using AES-256 with the provided key
+    message = encrypt_message_aes(message, key)
+    # Append end marker (note: base64 encoding does not include '#' so this marker is safe)
+    message += '####'
     binary_msg = ''.join(format(ord(char), '08b') for char in message)
 
     total_pixels = img.shape[0] * img.shape[1] * 3
@@ -90,7 +134,7 @@ def encode_image(image_path, message, output_path):
     messagebox.showinfo("Success", f"Message hidden successfully in {output_path}")
 
 def decode_image(image_path):
-    """Extracts a hidden message from an image."""
+    """Extracts a hidden message from an image using LSB steganography."""
     img = cv2.imread(image_path)
     if img is None:
         messagebox.showerror("Error", "Could not open the image!")
@@ -109,7 +153,11 @@ def decode_image(image_path):
 
     text = ""
     for i in range(0, len(binary_msg), 8):
-        char = chr(int(binary_msg[i:i+8], 2))
+        byte = binary_msg[i:i+8]
+        if len(byte) < 8:
+            break
+        char = chr(int(byte, 2))
+        # Check for our end marker "####"
         if char == '#' and text[-3:] == '###':
             update_progress(100)
             return text[:-3]
@@ -130,8 +178,13 @@ def encode_message():
         messagebox.showwarning("Warning", "Please enter a message to encode!")
         return
 
+    encryption_key = entry_key_encode.get()
+    if not encryption_key:
+        messagebox.showwarning("Warning", "Please enter an encryption key!")
+        return
+
     progress_bar["value"] = 0
-    threading.Thread(target=encode_image, args=(selected_file, message, "encoded_image.png"), daemon=True).start()
+    threading.Thread(target=encode_image, args=(selected_file, message, "encoded_image.png", encryption_key), daemon=True).start()
 
 def decode_message():
     """Handles decoding with threading to prevent UI freezing."""
@@ -143,6 +196,11 @@ def decode_message():
 
     def run_decoding():
         hidden_text = decode_image(selected_file)
+        decryption_key = entry_key_decode.get()
+        if decryption_key:
+            hidden_text = decrypt_message_aes(hidden_text, decryption_key)
+        else:
+            messagebox.showwarning("Warning", "Please enter a decryption key!")
         text_decoded.config(state=tk.NORMAL)
         text_decoded.delete("1.0", tk.END)
         text_decoded.insert(tk.END, hidden_text)
@@ -179,12 +237,21 @@ ttk.Label(encode_frame, text="Enter Message:").pack()
 text_message = tk.Text(encode_frame, height=4, width=60)
 text_message.pack(pady=5)
 
+ttk.Label(encode_frame, text="Encryption Key:").pack(pady=(10, 0))
+entry_key_encode = ttk.Entry(encode_frame, width=30, show="*")
+entry_key_encode.pack(pady=5)
+
 ttk.Button(encode_frame, text="Encode & Save", command=encode_message, bootstyle="success").pack(pady=5)
 
 # Decode Section
 decode_frame = ttk.Labelframe(root, text="Decode Message", padding=10)
 decode_frame.pack(pady=10, padx=10, fill="both")
 
+ttk.Label(decode_frame, text="Decryption Key:").pack(pady=(0, 5))
+entry_key_decode = ttk.Entry(decode_frame, width=30, show="*")
+entry_key_decode.pack(pady=5)
+
+# Moved Decode button below the decryption key input
 ttk.Button(decode_frame, text="Decode", command=decode_message, bootstyle="warning").pack(pady=10)
 
 ttk.Label(decode_frame, text="Decoded Message:").pack()
@@ -197,5 +264,5 @@ ttk.Button(decode_frame, text="Copy to Clipboard", command=copy_to_clipboard, bo
 progress_bar = ttk.Progressbar(root, mode="determinate", length=400)
 progress_bar.pack(pady=10)
 
-
+# Run the application
 root.mainloop()
